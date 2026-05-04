@@ -2,16 +2,17 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
+#include <WiFi.h>
 
-static const uint8_t PIN_TFT_DC  = 3;
-static const uint8_t PIN_ENC_A   = 5;
-static const uint8_t PIN_ENC_B   = 6;
-static const uint8_t PIN_ENC_BTN = 7;
+static const uint8_t PIN_TFT_DC  = 13;  // GP13
+static const uint8_t PIN_ENC_A   = 12;  // GP12
+static const uint8_t PIN_ENC_B   = 11;  // GP11
+static const uint8_t PIN_ENC_BTN = 10;  // GP10
 
 static bool    pinsSwapped  = false;
 static bool    pinsInverted = false;  // true = active HIGH, false = active LOW
-static uint8_t focusPin     = 8;
-static uint8_t shutterPin   = 9;
+static uint8_t focusPin     = 7;   // GP7 — TRS tip (default)
+static uint8_t shutterPin   = 6;   // GP6 — TRS ring (default)
 
 static inline uint8_t activeLevel()   { return pinsInverted ? HIGH : LOW; }
 static inline uint8_t inactiveLevel() { return pinsInverted ? LOW  : HIGH; }
@@ -22,7 +23,15 @@ static const uint32_t LONGPRESS_MS = 1000;
 static uint32_t focusMs   = 500;
 static uint32_t shutterMs = 200;
 
-Adafruit_ST7735 tft(-1, PIN_TFT_DC, -1);
+Adafruit_ST7735 tft(&SPI1, -1, PIN_TFT_DC, -1);
+
+static const char AP_SSID[]    = "hyperlapse";
+static const char AP_PASS[]    = "hyperlapse";
+static const char FW_VERSION[] = "1.1.0";
+static WiFiServer wifiServer(80);
+static char       wifiIP[16]  = "192.168.4.1";
+
+static bool wifiEnabled = true;
 
 enum State : uint8_t { DISARMED, ARMED, FOCUSING, SHOOTING, MENU };
 static State    state        = DISARMED;
@@ -39,6 +48,9 @@ static bool needStatusRedraw    = false;
 static bool needCountdownRedraw = false;
 static bool needPinStateRedraw  = false;
 
+static uint8_t menuScroll = 0;
+static const uint8_t MENU_VISIBLE = 6;
+
 static volatile int8_t  encRaw      = 0;
 static volatile uint8_t isrEncState = 0;
 static          int8_t  encCarry    = 0;
@@ -49,20 +61,41 @@ static uint32_t btnChangeMs  = 0;
 static uint32_t btnPressMs   = 0;
 static bool     btnLongFired = false;
 
-enum MenuItem : uint8_t {
-    MI_FOCUS_EN = 0,
-    MI_FOCUS_MS,
-    MI_PRE_FOCUS,
-    MI_SHUTTER_MS,
-    MI_SWAP_PINS,
-    MI_INVERT_PINS,
-    MI_COUNT
+enum MenuSection : uint8_t { MS_BACK = 0, MS_CAMERA, MS_WIFI, MS_INFO, MS_COUNT };
+
+enum CameraItem : uint8_t {
+    CI_UP = 0, CI_FOCUS_EN, CI_FOCUS_MS, CI_PRE_FOCUS, CI_SHUTTER_MS,
+    CI_SWAP_PINS, CI_INVERT_PINS, CI_COUNT
 };
+enum WifiItem : uint8_t { WI_UP = 0, WI_STATE, WI_IP, WI_COUNT };
+enum InfoItem : uint8_t { II_UP = 0, II_VERSION, II_COUNT };
+
+static uint8_t menuLevel   = 0;  // 0 = section list, 1 = items within section
+static uint8_t menuSection = 0;
 static uint8_t menuIdx     = 0;
 static bool    menuEditing = false;
 
 // Tracks last displayed remaining-second value; UINT32_MAX forces immediate redraw on arm.
 static uint32_t lastDisplayedRemSec = UINT32_MAX;
+
+// ==========================================================================
+// WiFi helpers
+
+static void startWiFi() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+
+    IPAddress ip = WiFi.softAPIP();
+    snprintf(wifiIP, sizeof(wifiIP), "%u.%u.%u.%u",
+             ip[0], ip[1], ip[2], ip[3]);
+
+    wifiServer.begin();
+}
+
+static void stopWiFi() {
+    wifiServer.stop();
+    WiFi.softAPdisconnect(true);
+}
 
 // ===========================================================================
 
@@ -94,6 +127,18 @@ static void formatTime(uint32_t s, char* buf, size_t len) {
         snprintf(buf, len, "%um%02us", (unsigned)(s / 60), (unsigned)(s % 60));
     } else {
         snprintf(buf, len, "%us", (unsigned)s);
+    }
+}
+
+// ===========================================================================
+// Menu helpers
+
+static uint8_t sectionItemCount() {
+    switch (menuSection) {
+        case MS_CAMERA: return (uint8_t)CI_COUNT;
+        case MS_WIFI:   return (uint8_t)WI_COUNT;
+        case MS_INFO:   return (uint8_t)II_COUNT;
+        default:        return 0;
     }
 }
 
@@ -162,52 +207,119 @@ static void drawCountdown() {
 }
 
 static void drawMenuItem(uint8_t i) {
-    uint8_t  y       = 26 + i * 14;
-    bool     sel     = (i == menuIdx);
-    bool     editing = sel && menuEditing;
-    uint16_t dimCol  = 0x7BEF;
-    uint16_t selCol  = ST77XX_WHITE;
-    uint16_t valCol  = editing ? ST77XX_YELLOW : (sel ? selCol : dimCol);
+    uint8_t visibleIndex = i - menuScroll;
+    if (visibleIndex >= MENU_VISIBLE) return;
+
+    uint8_t y = 26 + visibleIndex * 14;
+    bool sel     = (i == menuIdx);
+    bool editing = sel && menuEditing;
+
+    uint16_t dimCol = 0x7BEF;
+    uint16_t selCol = ST77XX_WHITE;
+    uint16_t selDimCol = 0x9CF3;
+    uint16_t valCol = editing ? ST77XX_YELLOW : (sel ? selCol : dimCol);
 
     tft.fillRect(0, y, 128, 12, ST77XX_BLACK);
     tft.setTextSize(1);
     tft.setCursor(0, y + 2);
-    tft.setTextColor(sel ? selCol : dimCol);
-    tft.print(editing ? '*' : (sel ? '>' : ' '));
-    tft.print(' ');
 
-    switch ((MenuItem)i) {
-        case MI_FOCUS_EN:
-            tft.print("Focus:     ");
-            tft.setTextColor(valCol);
-            tft.print(focusEnabled ? "ON" : "OFF");
+    if (menuLevel == 0) {
+        static const char* const names[MS_COUNT] = {"^ Exit", "CAMERA", "WIFI", "INFO"};
+        tft.setTextColor(sel ? selCol : dimCol);
+        tft.print(sel ? " > " : "   ");
+        if (i < MS_COUNT) tft.print(names[i]);
+        return;
+    }
+
+    // Level 1 — items within a section
+    bool isUp   = (i == 0);
+    bool isInfo = !isUp &&
+                  ((menuSection == MS_WIFI && i == WI_IP) ||
+                   (menuSection == MS_INFO && (i == II_VERSION)));
+
+    if (isInfo) {
+        tft.setTextColor(sel ? selDimCol : dimCol);
+        tft.print(' ');
+        tft.print(sel ? '>' : ' ');
+        tft.print(' ');
+    } else {
+        tft.setTextColor(isUp ? (sel ? ST77XX_CYAN : dimCol) : (sel ? selCol : dimCol));
+        tft.print(' ');
+        tft.print(editing ? '$' : (sel ? '>' : ' '));
+        tft.print(' ');
+    }
+
+    switch (menuSection) {
+        case MS_CAMERA:
+            switch ((CameraItem)i) {
+                case CI_FOCUS_EN:
+                    tft.print("Focus:     ");
+                    tft.setTextColor(valCol);
+                    tft.print(focusEnabled ? "ON" : "OFF");
+                    break;
+                case CI_FOCUS_MS:
+                    tft.print("Focus ms:  ");
+                    tft.setTextColor(valCol);
+                    tft.print((unsigned)focusMs);
+                    break;
+                case CI_PRE_FOCUS:
+                    tft.print("Pre-focus: ");
+                    tft.setTextColor(valCol);
+                    tft.print(preFocus ? "ON" : "OFF");
+                    break;
+                case CI_SHUTTER_MS:
+                    tft.print("Shttr ms:  ");
+                    tft.setTextColor(valCol);
+                    tft.print((unsigned)shutterMs);
+                    break;
+                case CI_SWAP_PINS:
+                    tft.print("Tip/Ring:  ");
+                    tft.setTextColor(valCol);
+                    tft.print(pinsSwapped ? "S/F" : "F/S");
+                    break;
+                case CI_INVERT_PINS:
+                    tft.print("Active:    ");
+                    tft.setTextColor(valCol);
+                    tft.print(pinsInverted ? "Low" : "High");
+                    break;
+                case CI_UP:
+                    tft.print("^ Back");
+                    break;
+                default: break;
+            }
             break;
-        case MI_FOCUS_MS:
-            tft.print("Focus ms:  ");
-            tft.setTextColor(valCol);
-            tft.print((unsigned)focusMs);
+
+        case MS_WIFI:
+            switch ((WifiItem)i) {
+                case WI_STATE:
+                    tft.print("WiFi:      ");
+                    tft.setTextColor(valCol);
+                    tft.print(wifiEnabled ? "ON" : "OFF");
+                    break;
+                case WI_IP:
+                    tft.print("IP:");
+                    tft.print(wifiIP);
+                    break;
+                case WI_UP:
+                    tft.print("^ Back");
+                    break;
+                default: break;
+            }
             break;
-        case MI_PRE_FOCUS:
-            tft.print("Pre-focus: ");
-            tft.setTextColor(valCol);
-            tft.print(preFocus ? "ON" : "OFF");
+
+        case MS_INFO: {
+            switch ((InfoItem)i) {
+                case II_VERSION:
+                    tft.print("FW:");
+                    tft.print(FW_VERSION);
+                    break;
+                case II_UP:
+                    tft.print("^ Back");
+                    break;
+                default: break;
+            }
             break;
-        case MI_SHUTTER_MS:
-            tft.print("Shttr ms:  ");
-            tft.setTextColor(valCol);
-            tft.print((unsigned)shutterMs);
-            break;
-        case MI_SWAP_PINS:
-            tft.print("Tip/Ring:  ");
-            tft.setTextColor(valCol);
-            tft.print(pinsSwapped ? "S/F" : "F/S");
-            break;
-        case MI_INVERT_PINS:
-            tft.print("Active:    ");
-            tft.setTextColor(valCol);
-            tft.print(pinsInverted ? "Low" : "High");
-            break;
-        default: break;
+        }
     }
 }
 
@@ -221,11 +333,26 @@ static void updateDisplay() {
         tft.fillScreen(ST77XX_BLACK);
 
         if (state == MENU) {
+            static const char* const sectionNames[MS_COUNT] = {"", "CAMERA", "WIFI", "INFO"};
+
             tft.setTextSize(2);
             tft.setTextColor(ST77XX_WHITE);
             tft.setCursor(4, 4);
-            tft.print("SETTINGS");
-            for (uint8_t i = 0; i < MI_COUNT; i++) drawMenuItem(i);
+            tft.print(menuLevel == 0 ? "SETTINGS" : sectionNames[menuSection]);
+
+            uint8_t total = (menuLevel == 0) ? (uint8_t)MS_COUNT : sectionItemCount();
+
+            if (menuIdx < menuScroll) menuScroll = menuIdx;
+            if (menuIdx >= menuScroll + MENU_VISIBLE)
+                menuScroll = menuIdx - MENU_VISIBLE + 1;
+            if (total > MENU_VISIBLE && menuScroll > total - MENU_VISIBLE)
+                menuScroll = total - MENU_VISIBLE;
+
+            uint8_t end = min((uint8_t)(menuScroll + MENU_VISIBLE), total);
+            for (uint8_t i = menuScroll; i < end; i++) {
+                drawMenuItem(i);
+            }
+
             tft.setTextSize(1);
             tft.setTextColor(0x7BEF);
             tft.setCursor(4, 118);
@@ -254,8 +381,9 @@ static void updateDisplay() {
 // ===========================================================================
 
 static void adjustMenuItemValue(int8_t dir) {
-    switch ((MenuItem)menuIdx) {
-        case MI_FOCUS_MS: {
+    if (menuSection != MS_CAMERA) return;
+    switch ((CameraItem)menuIdx) {
+        case CI_FOCUS_MS: {
             int32_t v = (int32_t)focusMs + dir * 50;
             focusMs = (uint32_t)(v < 50 ? 50 : v > 5000 ? 5000 : v);
             // focusMs must stay below intervalMs; bump interval up if needed
@@ -266,7 +394,7 @@ static void adjustMenuItemValue(int8_t dir) {
             }
             break;
         }
-        case MI_SHUTTER_MS: {
+        case CI_SHUTTER_MS: {
             int32_t v = (int32_t)shutterMs + dir * 50;
             shutterMs = (uint32_t)(v < 50 ? 50 : v > 2000 ? 2000 : v);
             break;
@@ -306,7 +434,9 @@ static void enterState(State next) {
             needPinStateRedraw  = true;
             break;
         case MENU:
+            menuLevel   = 0;
             menuIdx     = 0;
+            menuScroll  = 0;
             menuEditing = false;
             needFullRedraw = true;
             break;
@@ -324,31 +454,74 @@ static void handleShortPress() {
             enterState(DISARMED);
             break;
         case MENU:
-            if (menuIdx == MI_FOCUS_EN) {
-                focusEnabled = !focusEnabled;
-                needFullRedraw = true;
-            } else if (menuIdx == MI_PRE_FOCUS) {
-                preFocus = !preFocus;
-                needFullRedraw = true;
-            } else if (menuIdx == MI_SWAP_PINS) {
-                digitalWrite(focusPin,   inactiveLevel());
-                digitalWrite(shutterPin, inactiveLevel());
-                pinsSwapped = !pinsSwapped;
-                focusPin   = pinsSwapped ? 9 : 8;
-                shutterPin = pinsSwapped ? 8 : 9;
-                pinMode(focusPin,   OUTPUT); digitalWrite(focusPin,   inactiveLevel());
-                pinMode(shutterPin, OUTPUT); digitalWrite(shutterPin, inactiveLevel());
-                needFullRedraw = true;
-            } else if (menuIdx == MI_INVERT_PINS) {
-                digitalWrite(focusPin,   inactiveLevel());
-                digitalWrite(shutterPin, inactiveLevel());
-                pinsInverted = !pinsInverted;
-                digitalWrite(focusPin,   inactiveLevel());
-                digitalWrite(shutterPin, inactiveLevel());
+            if (menuLevel == 0) {
+                if (menuIdx == MS_BACK) {
+                    enterState(DISARMED);
+                    return;
+                }
+                menuLevel   = 1;
+                menuSection = menuIdx;
+                menuIdx     = 1;
+                menuScroll  = 0;
+                menuEditing = false;
                 needFullRedraw = true;
             } else {
-                menuEditing = !menuEditing;
-                needFullRedraw = true;
+                bool isUp = (menuIdx == 0);
+                if (isUp) {
+                    menuLevel  = 0;
+                    menuIdx    = menuSection;
+                    menuScroll = 0;
+                    menuEditing = false;
+                    needFullRedraw = true;
+                    break;
+                }
+                switch (menuSection) {
+                    case MS_CAMERA:
+                        switch ((CameraItem)menuIdx) {
+                            case CI_FOCUS_EN:
+                                focusEnabled = !focusEnabled;
+                                needFullRedraw = true;
+                                break;
+                            case CI_PRE_FOCUS:
+                                preFocus = !preFocus;
+                                needFullRedraw = true;
+                                break;
+                            case CI_SWAP_PINS:
+                                digitalWrite(focusPin,   inactiveLevel());
+                                digitalWrite(shutterPin, inactiveLevel());
+                                pinsSwapped = !pinsSwapped;
+                                focusPin   = pinsSwapped ? 6 : 7;
+                                shutterPin = pinsSwapped ? 7 : 6;
+                                pinMode(focusPin,   OUTPUT); digitalWrite(focusPin,   inactiveLevel());
+                                pinMode(shutterPin, OUTPUT); digitalWrite(shutterPin, inactiveLevel());
+                                needFullRedraw = true;
+                                break;
+                            case CI_INVERT_PINS:
+                                digitalWrite(focusPin,   inactiveLevel());
+                                digitalWrite(shutterPin, inactiveLevel());
+                                pinsInverted = !pinsInverted;
+                                digitalWrite(focusPin,   inactiveLevel());
+                                digitalWrite(shutterPin, inactiveLevel());
+                                needFullRedraw = true;
+                                break;
+                            case CI_FOCUS_MS:
+                            case CI_SHUTTER_MS:
+                                menuEditing = !menuEditing;
+                                needFullRedraw = true;
+                                break;
+                            default: break;
+                        }
+                        break;
+                    case MS_WIFI:
+                        if ((WifiItem)menuIdx == WI_STATE) {
+                            if (wifiEnabled) { stopWiFi();  wifiEnabled = false; }
+                            else             { startWiFi(); wifiEnabled = true;  }
+                            needFullRedraw = true;
+                        }
+                        break;
+                    case MS_INFO:
+                        break;
+                }
             }
             break;
     }
@@ -364,9 +537,289 @@ static void handleLongPress() {
 }
 
 // ===========================================================================
+// Web interface
 
-ISR(PCINT2_vect) {
-    uint8_t curr = (PIND >> 5) & 0x03;  // bit0=pin5(A), bit1=pin6(B)
+static const char PAGE_HTML[] = R"EOF(<!DOCTYPE html>
+<html><head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Hyperlapse</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#000;color:#ddd;font-family:monospace;padding:1em;max-width:480px;margin:0 auto}
+h1{color:#0ff;letter-spacing:3px;padding:.5em 0;border-bottom:1px solid #222;margin-bottom:.8em}
+.row{display:flex;justify-content:space-between;align-items:center;padding:.35em 0;border-bottom:1px solid #111}
+.lbl{color:#7bef;font-size:.85em}
+.val{font-weight:bold}
+.arm{color:#0f0}.dis{color:#f00}.focusing,.shooting{color:#ff0}
+.pon{color:#0f0}.poff{color:#333}
+.btn{background:#1a1a1a;color:#ddd;border:1px solid #444;padding:.5em 1.2em;cursor:pointer;font:1em monospace;border-radius:3px;margin:.2em}
+.go{background:#003300;border-color:#0f0;color:#0f0}
+.stop{background:#330000;border-color:#f00;color:#f00}
+.exitmenu{background:#001a33;border-color:#07f;color:#7af}
+.save{background:#001933;border-color:#06f;color:#6af;width:100%;margin-top:.6em}
+input[type=number]{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1em monospace;width:90px;border-radius:3px}
+select{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1em monospace;border-radius:3px}
+.tabs{display:flex;gap:3px;margin:.8em 0 0}
+.tab{flex:1;background:#111;color:#7bef;border:1px solid #333;padding:.4em;cursor:pointer;font:1em monospace;border-radius:3px 3px 0 0;border-bottom:none}
+.tab.on{background:#1a1a1a;color:#fff;border-color:#555}
+.panel{border:1px solid #333;padding:.6em;display:none}
+.panel.on{display:block}
+.info{color:#7bef;font-size:.85em;padding:.3em 0;border-bottom:1px solid #111}
+#disp{margin-bottom:.8em}
+</style></head>
+<body>
+<h1>HYPERLAPSE</h1>
+<div id='disp'></div>
+<button id='ab' class='btn go' onclick='arm()'>ARM</button>
+<div class='tabs'>
+<button class='tab on' onclick='tab(0)' id='t0'>CAMERA</button>
+<button class='tab' onclick='tab(1)' id='t1'>WIFI</button>
+<button class='tab' onclick='tab(2)' id='t2'>INFO</button>
+</div>
+<div id='p0' class='panel on'>
+<form id='sf' onsubmit='save(event)'>
+<div class='row'><span class='lbl'>Interval (s)</span><input type='number' id='iv' name='interval' min='1' max='3600'></div>
+<div class='row'><span class='lbl'>Focus</span><select id='fe' name='focusEnabled'><option value='1'>ON</option><option value='0'>OFF</option></select></div>
+<div class='row'><span class='lbl'>Focus ms</span><input type='number' id='fm' name='focusMs' min='50' max='5000' step='50'></div>
+<div class='row'><span class='lbl'>Pre-focus</span><select id='pf' name='preFocus'><option value='1'>ON</option><option value='0'>OFF</option></select></div>
+<div class='row'><span class='lbl'>Shutter ms</span><input type='number' id='sm' name='shutterMs' min='50' max='2000' step='50'></div>
+<div class='row'><span class='lbl'>Tip / Ring</span><select id='ps' name='pinsSwapped'><option value='0'>F / S</option><option value='1'>S / F</option></select></div>
+<div class='row'><span class='lbl'>Active level</span><select id='pi' name='pinsInverted'><option value='0'>LOW</option><option value='1'>HIGH</option></select></div>
+<button class='btn save' type='submit'>SAVE SETTINGS</button>
+</form>
+</div>
+<div id='p1' class='panel'>
+<div class='row'><span class='lbl'>WiFi</span><select id='we' onchange='saveWifi(this.value)'><option value='1'>ON</option><option value='0'>OFF</option></select></div>
+<div class='info' id='wi-ip'>IP: —</div>
+</div>
+<div id='p2' class='panel'>
+<div class='info' id='inf-up'>Uptime: —</div>
+<div class='info' id='inf-fw'>Firmware: —</div>
+</div>
+<script>
+var ok=false;
+function tab(n){
+  for(var i=0;i<3;i++){
+    var on=i===n;
+    document.getElementById('t'+i).className='tab'+(on?' on':'');
+    document.getElementById('p'+i).className='panel'+(on?' on':'');
+  }
+}
+function fmt(s){
+  if(s>=3600)return Math.floor(s/3600)+'h'+pad(Math.floor((s%3600)/60))+'m'+pad(s%60)+'s';
+  if(s>=60)return Math.floor(s/60)+'m'+pad(s%60)+'s';
+  return s+'s';
+}
+function pad(n){return String(n).padStart(2,'0');}
+function upd(d){
+  var sc=d.state==='ARMED'?'arm':d.state==='DISARMED'?'dis':d.state==='FOCUSING'?'focusing':d.state==='SHOOTING'?'shooting':'dis';
+  var firing=(d.state==='FOCUSING'||d.state==='SHOOTING');
+  var h='';
+  h+='<div class="row"><span class="lbl">STATUS</span><span class="val '+sc+'">'+d.state+'</span></div>';
+  h+='<div class="row"><span class="lbl">INTERVAL</span><span class="val">'+d.intervalSec+'s</span></div>';
+  h+='<div class="row"><span class="lbl">NEXT SHOT</span><span class="val" style="color:#0ff">'+(d.state==='ARMED'?d.countdown+'s':'---')+'</span></div>';
+  h+='<div class="row">'+(firing?'<span class="val" style="color:#0f0">&#9632; FIRING</span>':'<span class="val" style="color:#333">--- idle ---</span>')+'</div>';
+  h+='<div class="row"><span class="lbl">FOCUS PIN</span><span class="'+(d.focusActive?'pon':'poff')+'">'+(d.focusActive?'ACTIVE':'---')+'</span><span class="lbl">SHUTTER PIN</span><span class="'+(d.shutterActive?'pon':'poff')+'">'+(d.shutterActive?'ACTIVE':'---')+'</span></div>';
+  document.getElementById('disp').innerHTML=h;
+  var ab=document.getElementById('ab');
+  if(d.state==='DISARMED'){ab.textContent='ARM';ab.className='btn go';}
+  else if(d.state==='MENU'){ab.textContent='Exit Menu';ab.className='btn exitmenu';}
+  else{ab.textContent='DISARM';ab.className='btn stop';}
+  document.getElementById('wi-ip').textContent='IP: '+d.ip;
+  document.getElementById('inf-up').textContent='Uptime: '+fmt(d.uptimeSec);
+  document.getElementById('inf-fw').textContent='Firmware: '+d.fwVersion;
+  if(!ok){
+    function s(id,v){document.getElementById(id).value=v;}
+    s('iv',d.intervalSec);s('fe',d.focusEnabled?'1':'0');s('fm',d.focusMs);
+    s('pf',d.preFocus?'1':'0');s('sm',d.shutterMs);
+    s('ps',d.pinsSwapped?'1':'0');s('pi',d.pinsInverted?'1':'0');
+    s('we',d.wifiEnabled?'1':'0');
+    ok=true;
+  }
+}
+function poll(){fetch('/api/state').then(function(r){return r.json();}).then(upd).catch(function(){});}
+function arm(){fetch('/api/arm',{method:'POST'}).then(poll);}
+function save(e){
+  e.preventDefault();
+  var p=new URLSearchParams(new FormData(document.getElementById('sf')));
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()}).then(poll);
+}
+function saveWifi(v){
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'wifiEnabled='+v}).then(poll);
+}
+poll();setInterval(poll,100);
+</script>
+</body></html>
+)EOF";
+
+static String urlParam(const String& body, const char* key) {
+    String k = String(key) + "=";
+    int i = body.indexOf(k);
+    if (i < 0) return String();
+    i += k.length();
+    int j = body.indexOf('&', i);
+    return j < 0 ? body.substring(i) : body.substring(i, j);
+}
+
+static void serveMainPage(WiFiClient& client) {
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n");
+    client.print(PAGE_HTML);
+}
+
+static void serveState(WiFiClient& client) {
+    uint32_t countdown = 0;
+    if (state == ARMED) {
+        uint32_t elapsed    = millis() - lastShotMs;
+        uint32_t intervalMs = intervalSec * 1000UL;
+        countdown = elapsed >= intervalMs ? 0 : (intervalMs - elapsed + 999) / 1000;
+    }
+
+    const char* stateStr =
+        (state == DISARMED) ? "DISARMED" :
+        (state == ARMED)    ? "ARMED" :
+        (state == FOCUSING) ? "FOCUSING" :
+        (state == SHOOTING) ? "SHOOTING" :
+                              "MENU";
+
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"state\":\"%s\",\"intervalSec\":%lu,\"countdown\":%lu,"
+        "\"focusActive\":%s,\"shutterActive\":%s,"
+        "\"focusEnabled\":%s,\"focusMs\":%lu,\"preFocus\":%s,"
+        "\"shutterMs\":%lu,\"pinsSwapped\":%s,\"pinsInverted\":%s,"
+        "\"wifiEnabled\":%s,\"ip\":\"%s\","
+        "\"uptimeSec\":%lu,\"fwVersion\":\"%s\"}",
+        stateStr,
+        (unsigned long)intervalSec,
+        (unsigned long)countdown,
+        digitalRead(focusPin) == activeLevel() ? "true" : "false",
+        digitalRead(shutterPin) == activeLevel() ? "true" : "false",
+        focusEnabled ? "true" : "false",
+        (unsigned long)focusMs,
+        preFocus ? "true" : "false",
+        (unsigned long)shutterMs,
+        pinsSwapped ? "true" : "false",
+        pinsInverted ? "true" : "false",
+        wifiEnabled ? "true" : "false",
+        wifiIP,
+        (unsigned long)(millis() / 1000),
+        FW_VERSION
+    );
+
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    client.print(json);
+}
+
+static void handleArm(WiFiClient& client) {
+    if (state == DISARMED) enterState(ARMED);
+    else                   enterState(DISARMED);
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true}");
+}
+
+static void handleSettings(WiFiClient& client, const String& body) {
+    String v;
+
+    v = urlParam(body, "interval");
+    if (v.length()) { intervalSec = (uint32_t)constrain(v.toInt(), 1L, 3600L); needIntervalRedraw = true; }
+
+    v = urlParam(body, "focusEnabled");
+    if (v.length()) focusEnabled = v.toInt();
+
+    v = urlParam(body, "focusMs");
+    if (v.length()) {
+        focusMs = (uint32_t)constrain(v.toInt(), 50L, 5000L);
+        while (intervalSec * 1000UL <= focusMs) {
+            intervalSec = min(intervalSec + stepForInterval(intervalSec), (uint32_t)3600);
+            needIntervalRedraw = true;
+        }
+    }
+
+    v = urlParam(body, "preFocus");
+    if (v.length()) preFocus = v.toInt();
+
+    v = urlParam(body, "shutterMs");
+    if (v.length()) shutterMs = (uint32_t)constrain(v.toInt(), 50L, 2000L);
+
+    v = urlParam(body, "pinsSwapped");
+    if (v.length()) {
+        bool ns = v.toInt();
+        if (ns != pinsSwapped) {
+            digitalWrite(focusPin, inactiveLevel());
+            digitalWrite(shutterPin, inactiveLevel());
+            pinsSwapped = ns;
+            focusPin   = pinsSwapped ? 6 : 7;
+            shutterPin = pinsSwapped ? 7 : 6;
+            pinMode(focusPin,   OUTPUT); digitalWrite(focusPin,   inactiveLevel());
+            pinMode(shutterPin, OUTPUT); digitalWrite(shutterPin, inactiveLevel());
+        }
+    }
+
+    v = urlParam(body, "pinsInverted");
+    if (v.length()) {
+        bool ni = v.toInt();
+        if (ni != pinsInverted) {
+            digitalWrite(focusPin,   inactiveLevel());
+            digitalWrite(shutterPin, inactiveLevel());
+            pinsInverted = ni;
+            digitalWrite(focusPin,   inactiveLevel());
+            digitalWrite(shutterPin, inactiveLevel());
+        }
+    }
+
+    v = urlParam(body, "wifiEnabled");
+    if (v.length()) {
+        bool nw = v.toInt();
+        if (nw != wifiEnabled) {
+            if (!nw) { stopWiFi();  wifiEnabled = false; }
+            else     { startWiFi(); wifiEnabled = true;  }
+        }
+    }
+
+    needFullRedraw = true;
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true}");
+}
+
+static void handleWebClient() {
+    if (!wifiEnabled) return;
+    WiFiClient client = wifiServer.accept();
+    if (!client) return;
+
+    client.setTimeout(500);
+    String reqLine = client.readStringUntil('\n');
+
+    int contentLen = 0;
+    String hdr;
+    while (true) {
+        hdr = client.readStringUntil('\n');
+        hdr.trim();
+        if (hdr.isEmpty()) break;
+        if (hdr.startsWith("Content-Length:") || hdr.startsWith("content-length:"))
+            contentLen = hdr.substring(hdr.indexOf(':') + 1).toInt();
+    }
+
+    String body;
+    if (contentLen > 0) {
+        char buf[256];
+        int n = client.readBytes(buf, min(contentLen, 255));
+        buf[n] = '\0';
+        body = buf;
+    }
+
+    reqLine.trim();
+    if      (reqLine.startsWith("GET / ") || reqLine == "GET /") serveMainPage(client);
+    else if (reqLine.startsWith("GET /api/state"))               serveState(client);
+    else if (reqLine.startsWith("POST /api/arm"))                handleArm(client);
+    else if (reqLine.startsWith("POST /api/settings"))           handleSettings(client, body);
+    else client.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found");
+
+    client.stop();
+}
+
+// ===========================================================================
+
+static void encoderISR() {
+    uint8_t curr = (digitalRead(PIN_ENC_B) << 1) | digitalRead(PIN_ENC_A);
     switch ((isrEncState << 2) | curr) {
         case 0b0001: case 0b0111: case 0b1110: case 0b1000: encRaw--; break;
         case 0b0010: case 0b1011: case 0b1101: case 0b0100: encRaw++; break;
@@ -375,10 +828,10 @@ ISR(PCINT2_vect) {
 }
 
 static void readEncoder() {
-    cli();
+    noInterrupts();
     int8_t raw = encRaw;
     encRaw = 0;
-    sei();
+    interrupts();
 
     encCarry += raw;
     int8_t detents = encCarry / 4;
@@ -395,7 +848,11 @@ static void readEncoder() {
         if (menuEditing) {
             for (int8_t i = 0; i < count; i++) adjustMenuItemValue(dir);
         } else {
-            menuIdx = (uint8_t)(((int)menuIdx + MI_COUNT + dir) % MI_COUNT);
+            uint8_t total = (menuLevel == 0) ? (uint8_t)MS_COUNT : sectionItemCount();
+            int16_t newIdx = (int16_t)menuIdx + dir;
+            if (newIdx < 0) newIdx = total - 1;
+            if (newIdx >= total) newIdx = 0;
+            menuIdx = (uint8_t)newIdx;
         }
         needFullRedraw = true;
     }
@@ -473,12 +930,17 @@ void setup() {
     pinMode(PIN_ENC_B,   INPUT);
     pinMode(PIN_ENC_BTN, INPUT);
 
+    SPI1.setSCK(14);   // GP14 — physical pin 19
+    SPI1.setTX(15);    // GP15 — physical pin 20
+    SPI1.begin();
     tft.initR(INITR_BLACKTAB);
     tft.setRotation(2);
 
     isrEncState = (digitalRead(PIN_ENC_B) << 1) | digitalRead(PIN_ENC_A);
-    PCICR  |= (1 << PCIE2);
-    PCMSK2 |= (1 << PCINT21) | (1 << PCINT22);  // pin5=PCINT21, pin6=PCINT22
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encoderISR, CHANGE);
+
+    startWiFi();
 
     updateDisplay();
 }
@@ -487,6 +949,8 @@ void loop() {
     readEncoder();
     readButton();
     updateStateMachine();
+
+    handleWebClient();
 
     // Redraw countdown whenever remaining-second changes (relative to lastShotMs,
     // not absolute time — avoids stale lastCountdownSec causing wrong initial value).
