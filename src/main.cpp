@@ -100,9 +100,9 @@ static void stopWiFi() {
 // ===========================================================================
 
 static uint32_t stepForInterval(uint32_t s) {
-    if (s <= 60)  return 1;
-    if (s <= 300) return 5;
-    if (s <= 600) return 10;
+    if (s < 60)  return 1;
+    if (s < 300) return 5;
+    if (s < 600) return 10;
     return 30;
 }
 
