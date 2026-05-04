@@ -9,13 +9,13 @@ static const uint8_t PIN_ENC_A   = 12;  // GP12
 static const uint8_t PIN_ENC_B   = 11;  // GP11
 static const uint8_t PIN_ENC_BTN = 10;  // GP10
 
-static bool    pinsSwapped  = false;
-static bool    pinsInverted = false;  // true = active HIGH, false = active LOW
-static uint8_t focusPin     = 7;   // GP7 — TRS tip (default)
-static uint8_t shutterPin   = 6;   // GP6 — TRS ring (default)
+static bool    pinsSwapped      = false;
+static bool    pinsActiveLow    = true;  // true = active LOW, false = active HIGH
+static uint8_t focusPin         = 7;   // GP7 — TRS tip (default)
+static uint8_t shutterPin       = 6;   // GP6 — TRS ring (default)
 
-static inline uint8_t activeLevel()   { return pinsInverted ? HIGH : LOW; }
-static inline uint8_t inactiveLevel() { return pinsInverted ? LOW  : HIGH; }
+static inline uint8_t activeLevel()   { return pinsActiveLow ? LOW  : HIGH; }
+static inline uint8_t inactiveLevel() { return pinsActiveLow ? HIGH : LOW; }
 
 static const uint32_t DEBOUNCE_MS  = 50;
 static const uint32_t LONGPRESS_MS = 1000;
@@ -255,7 +255,7 @@ static void drawMenuItem(uint8_t i) {
         tft.print(' ');
     } else {
         tft.setTextColor(isUp ? (sel ? ST7735_CYAN : dimCol) : (sel ? selCol : dimCol));
-        tft.print(editing ? '$' : (sel ? '>' : ' '));
+        tft.print(editing ? '#' : (sel ? '>' : ' '));
         tft.print(' ');
     }
 
@@ -263,34 +263,34 @@ static void drawMenuItem(uint8_t i) {
         case MS_CAMERA:
             switch ((CameraItem)i) {
                 case CI_FOCUS_EN:
-                    tft.print("Focus:     ");
+                    tft.print("Focus:      ");
                     tft.setTextColor(valCol);
                     tft.print(focusEnabled ? "ON" : "OFF");
                     break;
                 case CI_FOCUS_MS:
-                    tft.print("Focus ms:  ");
+                    tft.print("Focus ms:   ");
                     tft.setTextColor(valCol);
                     tft.print((unsigned)focusMs);
                     break;
                 case CI_PRE_FOCUS:
-                    tft.print("Pre-focus: ");
+                    tft.print("Pre-focus:  ");
                     tft.setTextColor(valCol);
                     tft.print(preFocus ? "ON" : "OFF");
                     break;
                 case CI_SHUTTER_MS:
-                    tft.print("Shttr ms:  ");
+                    tft.print("Shutter ms: ");
                     tft.setTextColor(valCol);
                     tft.print((unsigned)shutterMs);
                     break;
                 case CI_SWAP_PINS:
-                    tft.print("Tip/Ring:  ");
+                    tft.print("Tip/Ring:   ");
                     tft.setTextColor(valCol);
                     tft.print(pinsSwapped ? "S/F" : "F/S");
                     break;
                 case CI_INVERT_PINS:
-                    tft.print("Active:    ");
+                    tft.print("Active Lvl: ");
                     tft.setTextColor(valCol);
-                    tft.print(pinsInverted ? "Low" : "High");
+                    tft.print(pinsActiveLow ? "Low" : "High");
                     break;
                 case CI_UP:
                     tft.print("^ Back");
@@ -509,7 +509,7 @@ static void handleShortPress() {
                             case CI_INVERT_PINS:
                                 digitalWrite(focusPin,   inactiveLevel());
                                 digitalWrite(shutterPin, inactiveLevel());
-                                pinsInverted = !pinsInverted;
+                                pinsActiveLow = !pinsActiveLow;
                                 digitalWrite(focusPin,   inactiveLevel());
                                 digitalWrite(shutterPin, inactiveLevel());
                                 needFullRedraw = true;
@@ -595,7 +595,7 @@ select{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1
 <div class='row'><span class='lbl'>Pre-focus</span><select id='pf' name='preFocus'><option value='1'>ON</option><option value='0'>OFF</option></select></div>
 <div class='row'><span class='lbl'>Shutter ms</span><input type='number' id='sm' name='shutterMs' min='50' max='2000' step='50'></div>
 <div class='row'><span class='lbl'>Tip / Ring</span><select id='ps' name='pinsSwapped'><option value='0'>F / S</option><option value='1'>S / F</option></select></div>
-<div class='row'><span class='lbl'>Active level</span><select id='pi' name='pinsInverted'><option value='0'>LOW</option><option value='1'>HIGH</option></select></div>
+<div class='row'><span class='lbl'>Active level</span><select id='pi' name='pinsActiveLow'><option value='0'>LOW</option><option value='1'>HIGH</option></select></div>
 <button class='btn save' type='submit'>SAVE SETTINGS</button>
 </form>
 </div>
@@ -641,7 +641,7 @@ function upd(d){
     function s(id,v){document.getElementById(id).value=v;}
     s('iv',d.intervalSec);s('fe',d.focusEnabled?'1':'0');s('fm',d.focusMs);
     s('pf',d.preFocus?'1':'0');s('sm',d.shutterMs);
-    s('ps',d.pinsSwapped?'1':'0');s('pi',d.pinsInverted?'1':'0');
+    s('ps',d.pinsSwapped?'1':'0');s('pi',d.pinsActiveLow?'1':'0');
     s('we',d.wifiEnabled?'1':'0');
     ok=true;
   }
@@ -695,7 +695,7 @@ static void serveState(WiFiClient& client) {
         "{\"state\":\"%s\",\"intervalSec\":%lu,\"countdown\":%lu,"
         "\"focusActive\":%s,\"shutterActive\":%s,"
         "\"focusEnabled\":%s,\"focusMs\":%lu,\"preFocus\":%s,"
-        "\"shutterMs\":%lu,\"pinsSwapped\":%s,\"pinsInverted\":%s,"
+        "\"shutterMs\":%lu,\"pinsSwapped\":%s,\"pinsActiveLow\":%s,"
         "\"wifiEnabled\":%s,\"ip\":\"%s\","
         "\"uptimeSec\":%lu,\"fwVersion\":\"%s\"}",
         stateStr,
@@ -708,7 +708,7 @@ static void serveState(WiFiClient& client) {
         preFocus ? "true" : "false",
         (unsigned long)shutterMs,
         pinsSwapped ? "true" : "false",
-        pinsInverted ? "true" : "false",
+        pinsActiveLow ? "true" : "false",
         wifiEnabled ? "true" : "false",
         wifiIP,
         (unsigned long)(millis() / 1000),
@@ -763,13 +763,13 @@ static void handleSettings(WiFiClient& client, const String& body) {
         }
     }
 
-    v = urlParam(body, "pinsInverted");
+    v = urlParam(body, "pinsActiveLow");
     if (v.length()) {
         bool ni = v.toInt();
-        if (ni != pinsInverted) {
+        if (ni != pinsActiveLow) {
             digitalWrite(focusPin,   inactiveLevel());
             digitalWrite(shutterPin, inactiveLevel());
-            pinsInverted = ni;
+            pinsActiveLow = ni;
             digitalWrite(focusPin,   inactiveLevel());
             digitalWrite(shutterPin, inactiveLevel());
         }
