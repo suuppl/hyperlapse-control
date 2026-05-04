@@ -1,5 +1,7 @@
 # hyperlapse-control
 
+> actually more of a timelapse control, as the camera is not moving necessarily ¯\\_(ツ)_/¯
+
 Intervalometer firmware for **Raspberry Pi Pico W**. Triggers a camera shutter via a 3.5 mm TRS jack at a configurable interval. Input is a rotary encoder with pushbutton; status is shown on a 1.44" ST7735S TFT display. A browser-accessible web UI is served over the Pico W's built-in Wi-Fi.
 
 ## Hardware
@@ -39,8 +41,8 @@ The Pico W boots as a Wi-Fi access point:
 
 | | |
 |---|---|
-| SSID | `hyperlapse` |
-| Password | `hyperlapse` |
+| SSID | `timelapse` |
+| Password | `timelapse` |
 | URL | `http://192.168.4.1` |
 
 The single-page UI shows current state, countdown to next shot, and live pin status. All settings can be changed without touching the device. Wi-Fi can be disabled from the settings menu.

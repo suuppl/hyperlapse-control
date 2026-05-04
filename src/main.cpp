@@ -25,8 +25,8 @@ static uint32_t shutterMs = 200;
 
 Adafruit_ST7735 tft(&SPI1, -1, PIN_TFT_DC, -1);
 
-static const char AP_SSID[]    = "hyperlapse";
-static const char AP_PASS[]    = "hyperlapse";
+static const char AP_SSID[]    = "timelapse";
+static const char AP_PASS[]    = "timelapse";
 static const char FW_VERSION[] = "1.1.0";
 static WiFiServer wifiServer(80);
 static char       wifiIP[16]  = "192.168.4.1";
@@ -146,36 +146,41 @@ static uint8_t sectionItemCount() {
 // Draw helpers
 
 static void drawPinState() {
-    tft.fillRect(98, 0, 30, 14, ST77XX_BLACK);
+    tft.fillRect(98, 0, 30, 14, ST7735_BLACK);
     tft.setTextSize(1);
     tft.setCursor(100, 4);
-    tft.setTextColor(digitalRead(focusPin) == activeLevel() ? ST77XX_GREEN : 0x7BEF);
+    tft.setTextColor(digitalRead(focusPin) == activeLevel() ? ST7735_GREEN : 0x7BEF);
     tft.print('F');
     tft.setCursor(116, 4);
-    tft.setTextColor(digitalRead(shutterPin) == activeLevel() ? ST77XX_GREEN : 0x7BEF);
+    tft.setTextColor(digitalRead(shutterPin) == activeLevel() ? ST7735_GREEN : 0x7BEF);
     tft.print('S');
 }
 
 static void drawInterval() {
-    tft.fillRect(0, 18, 128, 24, ST77XX_BLACK);
+    tft.fillRect(0, 24, 128, 24, ST7735_BLACK);
     char buf[12];
     formatTime(intervalSec, buf, sizeof(buf));
     tft.setTextSize(3);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(4, 18);
+    tft.setTextColor(ST7735_WHITE);
+    tft.setCursor(4, 24);
     tft.print(buf);
 }
 
 static void drawStatus() {
-    tft.fillRect(0, 74, 128, 16, ST77XX_BLACK);
+    tft.fillRect(0, 64, 128, 22, (state != DISARMED) ? ST7735_YELLOW : ST7735_GREEN);
     tft.setTextSize(2);
-    tft.setTextColor((state != DISARMED) ? ST77XX_GREEN : ST77XX_RED);
-    tft.setCursor(4, 74);
-    tft.print((state != DISARMED) ? "ARMED" : "DISARMED");
+    tft.setTextColor(ST7735_BLACK);
+    if (state != DISARMED) {
+        tft.setCursor(32, 68);
+        tft.print("ARMED");
+    } else {
+        tft.setCursor(18, 68);
+        tft.print("DISARMED");
+    }
 }
 
 static void drawCountdown() {
-    tft.fillRect(0, 100, 128, 28, ST77XX_BLACK);
+    tft.fillRect(0, 100, 128, 28, ST7735_BLACK);
     if (state == DISARMED) {
         tft.setTextSize(1);
         tft.setTextColor(0x7BEF);
@@ -184,15 +189,15 @@ static void drawCountdown() {
         tft.setCursor(4, 116);
         tft.print("hold: menu");
     } else if (state == FOCUSING) {
-        tft.fillRect(0, 100, 128, 28, ST77XX_CYAN);
+        tft.fillRect(0, 100, 128, 28, ST7735_CYAN);
         tft.setTextSize(2);
-        tft.setTextColor(ST77XX_BLACK);
+        tft.setTextColor(ST7735_BLACK);
         tft.setCursor(18, 106);
         tft.print("FOCUSING");
     } else if (state == SHOOTING) {
-        tft.fillRect(0, 100, 128, 28, ST77XX_GREEN);
+        tft.fillRect(0, 100, 128, 28, ST7735_RED);
         tft.setTextSize(2);
-        tft.setTextColor(ST77XX_BLACK);
+        tft.setTextColor(ST7735_WHITE);
         tft.setCursor(39, 106);
         tft.print("FIRE!");
     } else if (state == ARMED) {
@@ -202,7 +207,7 @@ static void drawCountdown() {
         char nbuf[12];
         formatTime(remaining, nbuf, sizeof(nbuf));
         tft.setTextSize(1);
-        tft.setTextColor(ST77XX_CYAN);
+        tft.setTextColor(ST7735_CYAN);
         tft.setCursor(4, 104);
         tft.print("NEXT: ");
         tft.print(nbuf);
@@ -221,36 +226,35 @@ static void drawMenuItem(uint8_t i) {
     bool editing = sel && menuEditing;
 
     uint16_t dimCol = 0x7BEF;
-    uint16_t selCol = ST77XX_WHITE;
+    uint16_t selCol = ST7735_WHITE;
     uint16_t selDimCol = 0x9CF3;
-    uint16_t valCol = editing ? ST77XX_YELLOW : (sel ? selCol : dimCol);
+    uint16_t valCol = editing ? ST7735_YELLOW : (sel ? selCol : dimCol);
 
-    tft.fillRect(0, y, 128, 12, ST77XX_BLACK);
+    tft.fillRect(0, y, 128, 12, ST7735_BLACK);
     tft.setTextSize(1);
     tft.setCursor(0, y + 2);
+    bool isUp   = (i == 0);
 
     if (menuLevel == 0) {
         static const char* const names[MS_COUNT] = {"^ Exit", "CAMERA", "WIFI", "INFO"};
-        tft.setTextColor(sel ? selCol : dimCol);
-        tft.print(sel ? " > " : "   ");
+        tft.setTextColor(isUp ? (sel ? ST7735_CYAN : dimCol) : (sel ? selCol : dimCol));
+        tft.print(sel ? "> " : "  ");
         if (i < MS_COUNT) tft.print(names[i]);
         return;
     }
 
     // Level 1 — items within a section
-    bool isUp   = (i == 0);
+
     bool isInfo = !isUp &&
                   ((menuSection == MS_WIFI && i == WI_IP) ||
                    (menuSection == MS_INFO && (i == II_VERSION)));
 
     if (isInfo) {
         tft.setTextColor(sel ? selDimCol : dimCol);
-        tft.print(' ');
         tft.print(sel ? '>' : ' ');
         tft.print(' ');
     } else {
-        tft.setTextColor(isUp ? (sel ? ST77XX_CYAN : dimCol) : (sel ? selCol : dimCol));
-        tft.print(' ');
+        tft.setTextColor(isUp ? (sel ? ST7735_CYAN : dimCol) : (sel ? selCol : dimCol));
         tft.print(editing ? '$' : (sel ? '>' : ' '));
         tft.print(' ');
     }
@@ -336,13 +340,13 @@ static void updateDisplay() {
     if (needFullRedraw) {
         needFullRedraw = needIntervalRedraw = needStatusRedraw =
             needCountdownRedraw = needPinStateRedraw = false;
-        tft.fillScreen(ST77XX_BLACK);
+        tft.fillScreen(ST7735_BLACK);
 
         if (state == MENU) {
             static const char* const sectionNames[MS_COUNT] = {"", "CAMERA", "WIFI", "INFO"};
 
             tft.setTextSize(2);
-            tft.setTextColor(ST77XX_WHITE);
+            tft.setTextColor(ST7735_WHITE);
             tft.setCursor(4, 4);
             tft.print(menuLevel == 0 ? "SETTINGS" : sectionNames[menuSection]);
 
@@ -360,7 +364,7 @@ static void updateDisplay() {
             }
 
             tft.setTextSize(1);
-            tft.setTextColor(0x7BEF);
+            tft.setTextColor(ST7735_WHITE);
             tft.setCursor(4, 118);
             tft.print("hold btn: exit");
             return;
@@ -441,7 +445,7 @@ static void enterState(State next) {
             break;
         case MENU:
             menuLevel   = 0;
-            menuIdx     = 0;
+            menuIdx     = 1;
             menuScroll  = 0;
             menuEditing = false;
             needFullRedraw = true;
@@ -549,7 +553,7 @@ static const char PAGE_HTML[] = R"EOF(<!DOCTYPE html>
 <html><head>
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Hyperlapse</title>
+<title>Timelapse Control</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#000;color:#ddd;font-family:monospace;padding:1em;max-width:480px;margin:0 auto}
@@ -557,11 +561,11 @@ h1{color:#0ff;letter-spacing:3px;padding:.5em 0;border-bottom:1px solid #222;mar
 .row{display:flex;justify-content:space-between;align-items:center;padding:.35em 0;border-bottom:1px solid #111}
 .lbl{color:#7bef;font-size:.85em}
 .val{font-weight:bold}
-.arm{color:#0f0}.dis{color:#f00}.focusing,.shooting{color:#ff0}
+.arm{color:#ff0}.dis{color:#0f0}.focusing{color:#0ff}.shooting{color:#f00}
 .pon{color:#0f0}.poff{color:#333}
 .btn{background:#1a1a1a;color:#ddd;border:1px solid #444;padding:.5em 1.2em;cursor:pointer;font:1em monospace;border-radius:3px;margin:.2em}
-.go{background:#003300;border-color:#0f0;color:#0f0}
-.stop{background:#330000;border-color:#f00;color:#f00}
+.go{width:100%;display:block;background:#333300;border-color:#ff0;color:#ff0}
+.stop{width:100%;display:block;background:#003300;border-color:#0f0;color:#0f0}
 .exitmenu{background:#001a33;border-color:#07f;color:#7af}
 .save{background:#001933;border-color:#06f;color:#6af;width:100%;margin-top:.6em}
 input[type=number]{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1em monospace;width:90px;border-radius:3px}
@@ -575,7 +579,7 @@ select{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1
 #disp{margin-bottom:.8em}
 </style></head>
 <body>
-<h1>HYPERLAPSE</h1>
+<h1 style="text-align:center;">Timelapse Control</h1>
 <div id='disp'></div>
 <button id='ab' class='btn go' onclick='arm()'>ARM</button>
 <div class='tabs'>
@@ -937,7 +941,7 @@ void setup() {
     SPI1.setSCK(14);   // GP14 — physical pin 19
     SPI1.setTX(15);    // GP15 — physical pin 20
     SPI1.begin();
-    tft.initR(INITR_BLACKTAB);
+    tft.initR(INITR_GREENTAB);
     tft.setRotation(2);
 
     isrEncState = (digitalRead(PIN_ENC_B) << 1) | digitalRead(PIN_ENC_A);
@@ -950,6 +954,7 @@ void setup() {
 }
 
 void loop() {
+
     readEncoder();
     readButton();
     updateStateMachine();
@@ -969,4 +974,5 @@ void loop() {
     }
 
     updateDisplay();
+    
 }
