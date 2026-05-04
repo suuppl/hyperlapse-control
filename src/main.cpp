@@ -183,15 +183,21 @@ static void drawCountdown() {
         tft.print("press: arm");
         tft.setCursor(4, 116);
         tft.print("hold: menu");
-    } else if (state == FOCUSING || state == SHOOTING) {
+    } else if (state == FOCUSING) {
+        tft.fillRect(0, 100, 128, 28, ST77XX_CYAN);
+        tft.setTextSize(2);
+        tft.setTextColor(ST77XX_BLACK);
+        tft.setCursor(18, 106);
+        tft.print("FOCUSING");
+    } else if (state == SHOOTING) {
         tft.fillRect(0, 100, 128, 28, ST77XX_GREEN);
         tft.setTextSize(2);
         tft.setTextColor(ST77XX_BLACK);
-        tft.setCursor(34, 106);
+        tft.setCursor(39, 106);
         tft.print("FIRE!");
     } else if (state == ARMED) {
         uint32_t intervalMs = intervalSec * 1000UL;
-        uint32_t elapsed    = millis() - lastShotMs;
+        uint32_t elapsed    = millis() - lastShotMs + shutterMs;
         uint32_t remaining  = (elapsed >= intervalMs) ? 0 : (intervalMs - elapsed + 999) / 1000;
         char nbuf[12];
         formatTime(remaining, nbuf, sizeof(nbuf));
@@ -594,7 +600,6 @@ select{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1
 <div class='info' id='wi-ip'>IP: —</div>
 </div>
 <div id='p2' class='panel'>
-<div class='info' id='inf-up'>Uptime: —</div>
 <div class='info' id='inf-fw'>Firmware: —</div>
 </div>
 <script>
@@ -627,7 +632,6 @@ function upd(d){
   else if(d.state==='MENU'){ab.textContent='Exit Menu';ab.className='btn exitmenu';}
   else{ab.textContent='DISARM';ab.className='btn stop';}
   document.getElementById('wi-ip').textContent='IP: '+d.ip;
-  document.getElementById('inf-up').textContent='Uptime: '+fmt(d.uptimeSec);
   document.getElementById('inf-fw').textContent='Firmware: '+d.fwVersion;
   if(!ok){
     function s(id,v){document.getElementById(id).value=v;}
@@ -670,7 +674,7 @@ static void serveMainPage(WiFiClient& client) {
 static void serveState(WiFiClient& client) {
     uint32_t countdown = 0;
     if (state == ARMED) {
-        uint32_t elapsed    = millis() - lastShotMs;
+        uint32_t elapsed    = millis() - lastShotMs + shutterMs;
         uint32_t intervalMs = intervalSec * 1000UL;
         countdown = elapsed >= intervalMs ? 0 : (intervalMs - elapsed + 999) / 1000;
     }
@@ -893,7 +897,7 @@ static void updateStateMachine() {
             break;
 
         case ARMED: {
-            uint32_t elapsed    = now - lastShotMs;
+            uint32_t elapsed    = now - lastShotMs + shutterMs;
             uint32_t intervalMs = intervalSec * 1000UL;
             uint32_t fireMs = intervalMs;
             if (focusEnabled && preFocus && focusMs < intervalMs)
@@ -955,7 +959,7 @@ void loop() {
     // Redraw countdown whenever remaining-second changes (relative to lastShotMs,
     // not absolute time — avoids stale lastCountdownSec causing wrong initial value).
     if (state == ARMED) {
-        uint32_t elapsed    = millis() - lastShotMs;
+        uint32_t elapsed    = millis() - lastShotMs + shutterMs;
         uint32_t intervalMs = intervalSec * 1000UL;
         uint32_t remSec     = (elapsed >= intervalMs) ? 0 : (intervalMs - elapsed + 999) / 1000;
         if (remSec != lastDisplayedRemSec) {
