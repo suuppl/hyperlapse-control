@@ -12,14 +12,19 @@ Intervalometer firmware for **Raspberry Pi Pico W**. Triggers a camera shutter v
 | 16 | GP12 | Encoder A (external pull-up) |
 | 15 | GP11 | Encoder B (external pull-up) |
 | 14 | GP10 | Encoder button (external pull-up) |
-| 10 | GP7 | Focus output → TRS tip (default) |
-| 9  | GP6 | Shutter output → TRS ring (default) |
-| 20 | SPI1 TX | TFT MOSI (hardware SPI) |
-| 19 | SPI1 SCK | TFT SCK (hardware SPI) |
+| 12 | GP9  | Focus output → TRS tip (default) |
+| 9  | GP6  | Shutter output → TRS ring (default) |
+| 7  | GP5  | Arm interlock switch (HIGH = armed-enabled, internal pull-down) |
+| 5  | GP3  | Shutter status LED (active HIGH output) |
+| 4  | GP2  | Focus status LED (active HIGH output) |
+| 20 | GP15 | TFT MOSI (SPI1 TX) |
+| 19 | GP14 | TFT SCK (SPI1 SCK) |
 
 TFT CS is hardwired to GND (always selected); RST is hardwired to 3.3 V (no reset line needed). Both are passed as `-1` to the Adafruit driver.
 
-Camera connector: 3.5 mm TRS. By default, focus is on the tip (GP7) and shutter is on the ring (GP6). Sleeve is GND. Default polarity is active LOW (open-collector style — pull to GND to activate). Both the tip/ring assignment and the polarity can be changed in the settings menu.
+Camera connector: 3.5 mm TRS. By default, focus is on the tip (GP9) and shutter is on the ring (GP6). Sleeve is GND. Default polarity is active LOW (open-collector style — pull to GND to activate). Both the tip/ring assignment and the polarity can be changed in the settings menu.
+
+The interlock switch on GP5 must be HIGH to allow arming. If it goes LOW while the device is armed or firing, it immediately disarms. An internal pull-down keeps the input LOW (disabled) when the switch is open.
 
 ## Building
 

@@ -4,18 +4,75 @@
 #include <Adafruit_ST7735.h>
 #include <WiFi.h>
 
-static const uint8_t PIN_TFT_DC  = 13;  // GP13
-static const uint8_t PIN_ENC_A   = 12;  // GP12
-static const uint8_t PIN_ENC_B   = 11;  // GP11
-static const uint8_t PIN_ENC_BTN = 10;  // GP10
+// Physical pin → GP number (-1 = non-GPIO). Index = physical pin (1-40); [0] unused.
+static constexpr int8_t picoWpins[41] = {
+    -1,  //  0  (unused)
+     0,  //  1  GP0
+     1,  //  2  GP1
+    -1,  //  3  GND
+     2,  //  4  GP2
+     3,  //  5  GP3
+     4,  //  6  GP4
+     5,  //  7  GP5
+    -1,  //  8  GND
+     6,  //  9  GP6
+     7,  // 10  GP7
+     8,  // 11  GP8
+     9,  // 12  GP9
+    -1,  // 13  GND
+    10,  // 14  GP10
+    11,  // 15  GP11
+    12,  // 16  GP12
+    13,  // 17  GP13
+    -1,  // 18  GND
+    14,  // 19  GP14
+    15,  // 20  GP15
+    16,  // 21  GP16
+    17,  // 22  GP17
+    -1,  // 23  GND
+    18,  // 24  GP18
+    19,  // 25  GP19
+    20,  // 26  GP20
+    21,  // 27  GP21
+    -1,  // 28  GND
+    22,  // 29  GP22
+    -1,  // 30  RUN
+    26,  // 31  GP26 / A0
+    27,  // 32  GP27 / A1
+    -1,  // 33  ADC GND
+    28,  // 34  GP28 / A2
+    -1,  // 35  ADC VREF
+    -1,  // 36  3V3 Out
+    -1,  // 37  3V3 En
+    -1,  // 38  GND
+    -1,  // 39  VSYS
+    -1,  // 40  VBUS
+};
+
+static const uint8_t PIN_TFT_DC      = picoWpins[17];  // physical 17 → GP13
+static const uint8_t PIN_ENC_A       = picoWpins[16];  // physical 16 → GP12
+static const uint8_t PIN_ENC_B       = picoWpins[15];  // physical 15 → GP11
+static const uint8_t PIN_ENC_BTN     = picoWpins[14];  // physical 14 → GP10
+static const uint8_t PIN_LED_FOCUS   = picoWpins[ 4];  // physical  4 → GP2
+static const uint8_t PIN_LED_SHUTTER = picoWpins[ 5];  // physical  5 → GP3
+static const uint8_t PIN_INTERLOCK   = picoWpins[ 7];  // physical  7 → GP5
 
 static bool    pinsSwapped      = false;
 static bool    pinsActiveLow    = true;  // true = active LOW, false = active HIGH
-static uint8_t focusPin         = 7;   // GP7 — TRS tip (default)
-static uint8_t shutterPin       = 6;   // GP6 — TRS ring (default)
+static uint8_t focusPin         = picoWpins[12];  // physical 12 → GP9 (TRS tip, default)
+static uint8_t shutterPin       = picoWpins[ 9];  // physical  9 → GP6 (TRS ring, default)
 
 static inline uint8_t activeLevel()   { return pinsActiveLow ? LOW  : HIGH; }
 static inline uint8_t inactiveLevel() { return pinsActiveLow ? HIGH : LOW; }
+
+static void setFocusPin(uint8_t level) {
+    digitalWrite(focusPin, level);
+    digitalWrite(PIN_LED_FOCUS, level == activeLevel() ? HIGH : LOW);
+}
+static void setShutterPin(uint8_t level) {
+    digitalWrite(shutterPin, level);
+    digitalWrite(PIN_LED_SHUTTER, level == activeLevel() ? HIGH : LOW);
+}
 
 static const uint32_t DEBOUNCE_MS  = 50;
 static const uint32_t LONGPRESS_MS = 1000;
@@ -77,6 +134,22 @@ static bool    menuEditing = false;
 
 // Tracks last displayed remaining-second value; UINT32_MAX forces immediate redraw on arm.
 static uint32_t lastDisplayedRemSec = UINT32_MAX;
+
+static bool     lastInterlockState = true;
+static uint32_t interlockMsgMs     = 0;  // non-zero = show "LOCKED" message until expired
+
+struct WebSettings {
+    uint32_t intervalSec;
+    bool     focusEnabled;
+    uint32_t focusMs;
+    bool     preFocus;
+    uint32_t shutterMs;
+    bool     pinsSwapped;
+    bool     pinsActiveLow;
+    bool     wifiEnabled;
+};
+static bool        pendingWebValid = false;
+static WebSettings pendingWeb;
 
 // ==========================================================================
 // WiFi helpers
@@ -146,14 +219,17 @@ static uint8_t sectionItemCount() {
 // Draw helpers
 
 static void drawPinState() {
-    tft.fillRect(98, 0, 30, 14, ST7735_BLACK);
+    tft.fillRect(92, 0, 36, 14, ST7735_BLACK);
     tft.setTextSize(1);
-    tft.setCursor(100, 4);
+    tft.setCursor(92, 4);
     tft.setTextColor(digitalRead(focusPin) == activeLevel() ? ST7735_GREEN : 0x7BEF);
     tft.print('F');
-    tft.setCursor(116, 4);
+    tft.setCursor(104, 4);
     tft.setTextColor(digitalRead(shutterPin) == activeLevel() ? ST7735_GREEN : 0x7BEF);
     tft.print('S');
+    tft.setCursor(116, 4);
+    tft.setTextColor(digitalRead(PIN_INTERLOCK) == HIGH ? ST7735_GREEN : ST7735_RED);
+    tft.print('L');
 }
 
 static void drawInterval() {
@@ -183,11 +259,17 @@ static void drawCountdown() {
     tft.fillRect(0, 100, 128, 28, ST7735_BLACK);
     if (state == DISARMED) {
         tft.setTextSize(1);
-        tft.setTextColor(0x7BEF);
-        tft.setCursor(4, 104);
-        tft.print("press: arm");
-        tft.setCursor(4, 116);
-        tft.print("hold: menu");
+        if (interlockMsgMs != 0) {
+            tft.setTextColor(ST7735_RED);
+            tft.setCursor(4, 104);
+            tft.print("LOCKED");
+        } else {
+            tft.setTextColor(0x7BEF);
+            tft.setCursor(4, 104);
+            tft.print("press: arm");
+            tft.setCursor(4, 116);
+            tft.print("hold: menu");
+        }
     } else if (state == FOCUSING) {
         tft.fillRect(0, 100, 128, 28, ST7735_CYAN);
         tft.setTextSize(2);
@@ -390,6 +472,35 @@ static void updateDisplay() {
 
 // ===========================================================================
 
+static void applyWebSettings(const WebSettings& s) {
+    if (s.pinsSwapped != pinsSwapped) {
+        setFocusPin(inactiveLevel());
+        setShutterPin(inactiveLevel());
+        pinsSwapped = s.pinsSwapped;
+        focusPin   = pinsSwapped ? picoWpins[ 9] : picoWpins[12];
+        shutterPin = pinsSwapped ? picoWpins[12] : picoWpins[ 9];
+        pinMode(focusPin,   OUTPUT); setFocusPin(inactiveLevel());
+        pinMode(shutterPin, OUTPUT); setShutterPin(inactiveLevel());
+    }
+    if (s.pinsActiveLow != pinsActiveLow) {
+        setFocusPin(inactiveLevel());
+        setShutterPin(inactiveLevel());
+        pinsActiveLow = s.pinsActiveLow;
+        setFocusPin(inactiveLevel());
+        setShutterPin(inactiveLevel());
+    }
+    if (s.intervalSec != intervalSec) { intervalSec = s.intervalSec; needIntervalRedraw = true; }
+    focusEnabled = s.focusEnabled;
+    focusMs      = s.focusMs;
+    preFocus     = s.preFocus;
+    shutterMs    = s.shutterMs;
+    if (s.wifiEnabled != wifiEnabled) {
+        if (!s.wifiEnabled) { stopWiFi();  wifiEnabled = false; }
+        else                { startWiFi(); wifiEnabled = true;  }
+    }
+    needFullRedraw = true;
+}
+
 static void adjustMenuItemValue(int8_t dir) {
     if (menuSection != MS_CAMERA) return;
     switch ((CameraItem)menuIdx) {
@@ -420,26 +531,34 @@ static void enterState(State next) {
 
     switch (next) {
         case DISARMED:
-            digitalWrite(focusPin,   inactiveLevel());
-            digitalWrite(shutterPin, inactiveLevel());
+            if (pendingWebValid && (prev == ARMED || prev == FOCUSING || prev == SHOOTING)) {
+                pendingWebValid = false;
+                applyWebSettings(pendingWeb);
+            }
+            setFocusPin(inactiveLevel());
+            setShutterPin(inactiveLevel());
             if (prev == MENU) needFullRedraw = true;
             else { needStatusRedraw = true; needCountdownRedraw = true; needPinStateRedraw = true; }
             break;
         case ARMED:
-            digitalWrite(focusPin,   inactiveLevel());
-            digitalWrite(shutterPin, inactiveLevel());
+            if (pendingWebValid && prev == SHOOTING) {
+                pendingWebValid = false;
+                applyWebSettings(pendingWeb);
+            }
+            setFocusPin(inactiveLevel());
+            setShutterPin(inactiveLevel());
             if (prev == DISARMED || prev == MENU) lastShotMs = millis();
             lastDisplayedRemSec = UINT32_MAX;  // force immediate redraw with correct value
             if (prev == MENU) needFullRedraw = true;
             else { needStatusRedraw = true; needCountdownRedraw = true; needPinStateRedraw = true; }
             break;
         case FOCUSING:
-            digitalWrite(focusPin, activeLevel());
+            setFocusPin(activeLevel());
             needCountdownRedraw = true;
             needPinStateRedraw  = true;
             break;
         case SHOOTING:
-            digitalWrite(shutterPin, activeLevel());
+            setShutterPin(activeLevel());
             needCountdownRedraw = true;
             needPinStateRedraw  = true;
             break;
@@ -456,7 +575,12 @@ static void enterState(State next) {
 static void handleShortPress() {
     switch (state) {
         case DISARMED:
-            enterState(ARMED);
+            if (digitalRead(PIN_INTERLOCK) == HIGH) {
+                enterState(ARMED);
+            } else {
+                interlockMsgMs = millis();
+                needCountdownRedraw = true;
+            }
             break;
         case ARMED:
         case FOCUSING:
@@ -497,21 +621,21 @@ static void handleShortPress() {
                                 needFullRedraw = true;
                                 break;
                             case CI_SWAP_PINS:
-                                digitalWrite(focusPin,   inactiveLevel());
-                                digitalWrite(shutterPin, inactiveLevel());
+                                setFocusPin(inactiveLevel());
+                                setShutterPin(inactiveLevel());
                                 pinsSwapped = !pinsSwapped;
-                                focusPin   = pinsSwapped ? 6 : 7;
-                                shutterPin = pinsSwapped ? 7 : 6;
-                                pinMode(focusPin,   OUTPUT); digitalWrite(focusPin,   inactiveLevel());
-                                pinMode(shutterPin, OUTPUT); digitalWrite(shutterPin, inactiveLevel());
+                                focusPin   = pinsSwapped ? picoWpins[ 9] : picoWpins[12];
+                                shutterPin = pinsSwapped ? picoWpins[12] : picoWpins[ 9];
+                                pinMode(focusPin,   OUTPUT); setFocusPin(inactiveLevel());
+                                pinMode(shutterPin, OUTPUT); setShutterPin(inactiveLevel());
                                 needFullRedraw = true;
                                 break;
                             case CI_INVERT_PINS:
-                                digitalWrite(focusPin,   inactiveLevel());
-                                digitalWrite(shutterPin, inactiveLevel());
+                                setFocusPin(inactiveLevel());
+                                setShutterPin(inactiveLevel());
                                 pinsActiveLow = !pinsActiveLow;
-                                digitalWrite(focusPin,   inactiveLevel());
-                                digitalWrite(shutterPin, inactiveLevel());
+                                setFocusPin(inactiveLevel());
+                                setShutterPin(inactiveLevel());
                                 needFullRedraw = true;
                                 break;
                             case CI_FOCUS_MS:
@@ -562,12 +686,13 @@ h1{color:#0ff;letter-spacing:3px;padding:.5em 0;border-bottom:1px solid #222;mar
 .lbl{color:#7bef;font-size:.85em}
 .val{font-weight:bold}
 .arm{color:#ff0}.dis{color:#0f0}.focusing{color:#0ff}.shooting{color:#f00}
-.pon{color:#0f0}.poff{color:#333}
+.pon{color:#0f0}.poff{color:#333}.lflash{color:#f00;font-weight:bold}
 .btn{background:#1a1a1a;color:#ddd;border:1px solid #444;padding:.5em 1.2em;cursor:pointer;font:1em monospace;border-radius:3px;margin:.2em}
 .go{width:100%;display:block;background:#333300;border-color:#ff0;color:#ff0}
 .stop{width:100%;display:block;background:#003300;border-color:#0f0;color:#0f0}
 .exitmenu{background:#001a33;border-color:#07f;color:#7af}
 .save{background:#001933;border-color:#06f;color:#6af;width:100%;margin-top:.6em}
+.savepend{background:#332200;border-color:#ff0;color:#ff0}
 input[type=number]{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1em monospace;width:90px;border-radius:3px}
 select{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1em monospace;border-radius:3px}
 .tabs{display:flex;gap:3px;margin:.8em 0 0}
@@ -596,7 +721,7 @@ select{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1
 <div class='row'><span class='lbl'>Shutter ms</span><input type='number' id='sm' name='shutterMs' min='50' max='2000' step='50'></div>
 <div class='row'><span class='lbl'>Tip / Ring</span><select id='ps' name='pinsSwapped'><option value='0'>F / S</option><option value='1'>S / F</option></select></div>
 <div class='row'><span class='lbl'>Active level</span><select id='pi' name='pinsActiveLow'><option value='0'>LOW</option><option value='1'>HIGH</option></select></div>
-<button class='btn save' type='submit'>SAVE SETTINGS</button>
+<button id='sb' class='btn save' type='submit'>SAVE SETTINGS</button>
 </form>
 </div>
 <div id='p1' class='panel'>
@@ -607,7 +732,7 @@ select{background:#111;color:#ddd;border:1px solid #444;padding:.3em .5em;font:1
 <div class='info' id='inf-fw'>Firmware: —</div>
 </div>
 <script>
-var ok=false;
+var ok=false,lockFlash=false;
 function tab(n){
   for(var i=0;i<3;i++){
     var on=i===n;
@@ -630,11 +755,14 @@ function upd(d){
   h+='<div class="row"><span class="lbl">NEXT SHOT</span><span class="val" style="color:#0ff">'+(d.state==='ARMED'?d.countdown+'s':'---')+'</span></div>';
   h+='<div class="row">'+(firing?'<span class="val" style="color:#0f0">&#9632; FIRING</span>':'<span class="val" style="color:#333">--- idle ---</span>')+'</div>';
   h+='<div class="row"><span class="lbl">FOCUS PIN</span><span class="'+(d.focusActive?'pon':'poff')+'">'+(d.focusActive?'ACTIVE':'---')+'</span><span class="lbl">SHUTTER PIN</span><span class="'+(d.shutterActive?'pon':'poff')+'">'+(d.shutterActive?'ACTIVE':'---')+'</span></div>';
+  h+='<div class="row"><span class="lbl">INTERLOCK</span><span class="val '+(!d.interlockEnabled&&lockFlash?'lflash':d.interlockEnabled?'pon':'poff')+'">'+(d.interlockEnabled?'ENABLED':'DISABLED')+'</span></div>';
   document.getElementById('disp').innerHTML=h;
   var ab=document.getElementById('ab');
   if(d.state==='DISARMED'){ab.textContent='ARM';ab.className='btn go';}
   else if(d.state==='MENU'){ab.textContent='Exit Menu';ab.className='btn exitmenu';}
   else{ab.textContent='DISARM';ab.className='btn stop';}
+  var sb=document.getElementById('sb');
+  if(sb){sb.className='btn save'+(d.pendingSettings?' savepend':'');sb.textContent=d.pendingSettings?'SAVE SETTINGS (pending)':'SAVE SETTINGS';}
   document.getElementById('wi-ip').textContent='IP: '+d.ip;
   document.getElementById('inf-fw').textContent='Firmware: '+d.fwVersion;
   if(!ok){
@@ -647,7 +775,12 @@ function upd(d){
   }
 }
 function poll(){fetch('/api/state').then(function(r){return r.json();}).then(upd).catch(function(){});}
-function arm(){fetch('/api/arm',{method:'POST'}).then(poll);}
+function arm(){
+  fetch('/api/arm',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+    if(d.locked){lockFlash=true;poll();setTimeout(function(){lockFlash=false;poll();},1500);}
+    else{poll();}
+  });
+}
 function save(e){
   e.preventDefault();
   var p=new URLSearchParams(new FormData(document.getElementById('sf')));
@@ -690,13 +823,14 @@ static void serveState(WiFiClient& client) {
         (state == SHOOTING) ? "SHOOTING" :
                               "MENU";
 
-    char json[512];
+    char json[620];
     snprintf(json, sizeof(json),
         "{\"state\":\"%s\",\"intervalSec\":%lu,\"countdown\":%lu,"
         "\"focusActive\":%s,\"shutterActive\":%s,"
         "\"focusEnabled\":%s,\"focusMs\":%lu,\"preFocus\":%s,"
         "\"shutterMs\":%lu,\"pinsSwapped\":%s,\"pinsActiveLow\":%s,"
         "\"wifiEnabled\":%s,\"ip\":\"%s\","
+        "\"interlockEnabled\":%s,\"pendingSettings\":%s,"
         "\"uptimeSec\":%lu,\"fwVersion\":\"%s\"}",
         stateStr,
         (unsigned long)intervalSec,
@@ -711,6 +845,8 @@ static void serveState(WiFiClient& client) {
         pinsActiveLow ? "true" : "false",
         wifiEnabled ? "true" : "false",
         wifiIP,
+        digitalRead(PIN_INTERLOCK) == HIGH ? "true" : "false",
+        pendingWebValid ? "true" : "false",
         (unsigned long)(millis() / 1000),
         FW_VERSION
     );
@@ -720,71 +856,63 @@ static void serveState(WiFiClient& client) {
 }
 
 static void handleArm(WiFiClient& client) {
+    if (state == DISARMED && digitalRead(PIN_INTERLOCK) != HIGH) {
+        client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":false,\"locked\":true}");
+        return;
+    }
     if (state == DISARMED) enterState(ARMED);
     else                   enterState(DISARMED);
     client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true}");
 }
 
-static void handleSettings(WiFiClient& client, const String& body) {
+static WebSettings parseWebSettings(const String& body, const WebSettings& base) {
+    WebSettings s = base;
     String v;
 
     v = urlParam(body, "interval");
-    if (v.length()) { intervalSec = (uint32_t)constrain(v.toInt(), 1L, 3600L); needIntervalRedraw = true; }
+    if (v.length()) s.intervalSec = (uint32_t)constrain(v.toInt(), 1L, 3600L);
 
     v = urlParam(body, "focusEnabled");
-    if (v.length()) focusEnabled = v.toInt();
+    if (v.length()) s.focusEnabled = (bool)v.toInt();
 
     v = urlParam(body, "focusMs");
     if (v.length()) {
-        focusMs = (uint32_t)constrain(v.toInt(), 50L, 5000L);
-        while (intervalSec * 1000UL <= focusMs) {
-            intervalSec = min(intervalSec + stepForInterval(intervalSec), (uint32_t)3600);
-            needIntervalRedraw = true;
-        }
+        s.focusMs = (uint32_t)constrain(v.toInt(), 50L, 5000L);
+        while (s.intervalSec * 1000UL <= s.focusMs)
+            s.intervalSec = min(s.intervalSec + stepForInterval(s.intervalSec), (uint32_t)3600);
     }
 
     v = urlParam(body, "preFocus");
-    if (v.length()) preFocus = v.toInt();
+    if (v.length()) s.preFocus = (bool)v.toInt();
 
     v = urlParam(body, "shutterMs");
-    if (v.length()) shutterMs = (uint32_t)constrain(v.toInt(), 50L, 2000L);
+    if (v.length()) s.shutterMs = (uint32_t)constrain(v.toInt(), 50L, 2000L);
 
     v = urlParam(body, "pinsSwapped");
-    if (v.length()) {
-        bool ns = v.toInt();
-        if (ns != pinsSwapped) {
-            digitalWrite(focusPin, inactiveLevel());
-            digitalWrite(shutterPin, inactiveLevel());
-            pinsSwapped = ns;
-            focusPin   = pinsSwapped ? 6 : 7;
-            shutterPin = pinsSwapped ? 7 : 6;
-            pinMode(focusPin,   OUTPUT); digitalWrite(focusPin,   inactiveLevel());
-            pinMode(shutterPin, OUTPUT); digitalWrite(shutterPin, inactiveLevel());
-        }
-    }
+    if (v.length()) s.pinsSwapped = (bool)v.toInt();
 
     v = urlParam(body, "pinsActiveLow");
-    if (v.length()) {
-        bool ni = v.toInt();
-        if (ni != pinsActiveLow) {
-            digitalWrite(focusPin,   inactiveLevel());
-            digitalWrite(shutterPin, inactiveLevel());
-            pinsActiveLow = ni;
-            digitalWrite(focusPin,   inactiveLevel());
-            digitalWrite(shutterPin, inactiveLevel());
-        }
-    }
+    if (v.length()) s.pinsActiveLow = (bool)v.toInt();
 
     v = urlParam(body, "wifiEnabled");
-    if (v.length()) {
-        bool nw = v.toInt();
-        if (nw != wifiEnabled) {
-            if (!nw) { stopWiFi();  wifiEnabled = false; }
-            else     { startWiFi(); wifiEnabled = true;  }
-        }
-    }
+    if (v.length()) s.wifiEnabled = (bool)v.toInt();
 
-    needFullRedraw = true;
+    return s;
+}
+
+static void handleSettings(WiFiClient& client, const String& body) {
+    bool active = (state == ARMED || state == FOCUSING || state == SHOOTING);
+    WebSettings base = pendingWebValid
+        ? pendingWeb
+        : WebSettings{intervalSec, focusEnabled, focusMs, preFocus,
+                      shutterMs, pinsSwapped, pinsActiveLow, wifiEnabled};
+    WebSettings s = parseWebSettings(body, base);
+    if (active) {
+        pendingWeb      = s;
+        pendingWebValid = true;
+    } else {
+        applyWebSettings(s);
+    }
     client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true}");
 }
 
@@ -929,17 +1057,22 @@ static void updateStateMachine() {
 // ===========================================================================
 
 void setup() {
+    pinMode(PIN_LED_FOCUS,   OUTPUT);  digitalWrite(PIN_LED_FOCUS,   LOW);
+    pinMode(PIN_LED_SHUTTER, OUTPUT);  digitalWrite(PIN_LED_SHUTTER, LOW);
+    pinMode(PIN_INTERLOCK,   INPUT);
+    lastInterlockState = digitalRead(PIN_INTERLOCK) == HIGH;
+
     pinMode(focusPin,    OUTPUT);
     pinMode(shutterPin,  OUTPUT);
-    digitalWrite(focusPin,   inactiveLevel());
-    digitalWrite(shutterPin, inactiveLevel());
+    setFocusPin(inactiveLevel());
+    setShutterPin(inactiveLevel());
 
     pinMode(PIN_ENC_A,   INPUT);
     pinMode(PIN_ENC_B,   INPUT);
     pinMode(PIN_ENC_BTN, INPUT);
 
-    SPI1.setSCK(14);   // GP14 — physical pin 19
-    SPI1.setTX(15);    // GP15 — physical pin 20
+    SPI1.setSCK(picoWpins[19]);  // physical 19 → GP14
+    SPI1.setTX(picoWpins[20]);   // physical 20 → GP15
     SPI1.begin();
     tft.initR(INITR_GREENTAB);
     tft.setRotation(2);
@@ -954,6 +1087,18 @@ void setup() {
 }
 
 void loop() {
+    bool interlockNow = digitalRead(PIN_INTERLOCK) == HIGH;
+    if (interlockNow != lastInterlockState) {
+        lastInterlockState = interlockNow;
+        needPinStateRedraw = true;
+        if (!interlockNow && state != DISARMED && state != MENU)
+            enterState(DISARMED);
+    }
+
+    if (interlockMsgMs != 0 && millis() - interlockMsgMs >= 1500) {
+        interlockMsgMs = 0;
+        needCountdownRedraw = true;
+    }
 
     readEncoder();
     readButton();
